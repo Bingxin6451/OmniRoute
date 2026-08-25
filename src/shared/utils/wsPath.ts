@@ -23,6 +23,55 @@ export function deriveLiveWsPath(publicUrl?: string): string {
   }
 }
 
+/** Normalize a runtime WebSocket port reported by the handshake endpoint. */
+export function sanitizeLiveWsPort(value: unknown): number | null {
+  if (typeof value !== "number" && typeof value !== "string") return null;
+  if (typeof value === "string" && value.trim() === "") return null;
+
+  const port = typeof value === "number" ? value : Number(value);
+  return Number.isInteger(port) && port >= 1 && port <= 65535 ? port : null;
+}
+
+export interface ResolveLiveWsUrlOptions {
+  explicit?: string;
+  handshakeUrl?: string | null;
+  handshakePort?: unknown;
+  handshakePath?: string | null;
+  defaultUrl: string;
+}
+
+/**
+ * Resolve the dashboard WebSocket URL after runtime handshake discovery.
+ *
+ * A caller-provided URL wins, followed by a complete public URL reported by
+ * the server. Otherwise the valid runtime port/path are applied to the
+ * build-time default without letting malformed handshake values break the UI.
+ */
+export function resolveLiveWsUrl({
+  explicit,
+  handshakeUrl,
+  handshakePort,
+  handshakePath,
+  defaultUrl,
+}: ResolveLiveWsUrlOptions): string {
+  if (explicit) return explicit;
+  if (handshakeUrl) return handshakeUrl;
+
+  const port = sanitizeLiveWsPort(handshakePort);
+  const path =
+    typeof handshakePath === "string" && handshakePath.startsWith("/") ? handshakePath : null;
+  if (port === null && path === null) return defaultUrl;
+
+  try {
+    const resolved = new URL(defaultUrl);
+    if (port !== null) resolved.port = String(port);
+    if (path !== null) resolved.pathname = path;
+    return resolved.toString();
+  } catch {
+    return defaultUrl;
+  }
+}
+
 /**
  * The operator-declared public WebSocket URL, resolved at RUNTIME.
  *
