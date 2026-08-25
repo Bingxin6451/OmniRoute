@@ -344,6 +344,43 @@ export async function getProviderConnectionById(id: string) {
   );
 }
 
+export interface ProviderConnectionDisplayMetadata {
+  id: string;
+  name: string | null;
+  displayName: string | null;
+  email: string | null;
+}
+
+/**
+ * Reads only the non-credential fields needed by account display-name resolvers.
+ *
+ * This avoids decrypting provider credentials when a dashboard only needs labels.
+ */
+export function getProviderConnectionDisplayMetadata(
+  connectionIds: readonly string[]
+): ProviderConnectionDisplayMetadata[] {
+  const ids = [...new Set(connectionIds.filter((id) => id.length > 0))];
+  if (ids.length === 0) return [];
+
+  const db = getDbInstance() as unknown as DbLike;
+  const rows = db
+    .prepare(
+      `SELECT id, name, display_name, email FROM provider_connections
+       WHERE id IN (${ids.map(() => "?").join(", ")})`
+    )
+    .all(...ids);
+
+  return rows.map((row) => {
+    const view = rowToCamel(row) as JsonRecord;
+    return {
+      id: toStringOrNull(view.id) || "",
+      name: toStringOrNull(view.name),
+      displayName: toStringOrNull(view.displayName),
+      email: toStringOrNull(view.email),
+    };
+  });
+}
+
 // #3368 PR6 — dedup web-session cookie/token credentials on connection create.
 // Re-importing the same session (e.g. via bulk web-session import) under a
 // different or blank name must update the existing connection instead of
@@ -588,6 +625,10 @@ export async function createProviderConnection(data: JsonRecord) {
     "accessToken",
     "refreshToken",
     "expiresAt",
+    // #5326's payload sets this and _insertConnectionRow binds it, but it was
+    // missing from this allowlist — so every created row stored NULL however good
+    // the payload was. The update path already carries it (`data.tokenExpiresAt`).
+    "tokenExpiresAt",
     "tokenType",
     "scope",
     "idToken",
