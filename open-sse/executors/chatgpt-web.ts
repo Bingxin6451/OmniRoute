@@ -2566,54 +2566,16 @@ async function pollForAsyncImage(
 ): Promise<ImagePointerRef[]> {
   const totalTimeoutMs = opts.timeoutMs ?? configuredAsyncImageTimeoutMs();
   const deadline = Date.now() + totalTimeoutMs;
+  // Generous conversation-poll budget: the poll now runs concurrently with the
+  // WebSocket wait, so it needs its own headroom past the WS deadline.
+  const pollDeadline = deadline + 60_000;
 
-  // One reconnect attempt on transport error: the WS endpoint is signed and
-  // short-lived, and a network blip during the long wait would otherwise
-  // lose the image entirely. The deadline is shared across attempts so we
-  // never exceed the caller's budget.
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const remaining = deadline - Date.now();
-    if (remaining <= 0) break;
-    const wssUrl = await registerWebSocket(ctx);
-    if (!wssUrl) {
-      ctx.log?.warn?.(
-        "CGPT-WEB",
-        attempt === 0
-          ? "Could not register WebSocket — async image gen not retrievable"
-          : `WebSocket re-registration failed on retry attempt ${attempt + 1}`
-      );
-      if (attempt === 0) continue; // try again — registration can be flaky
-      break; // fall through to the conversation-poll fallback below
-    }
-    ctx.log?.debug?.(
-      "CGPT-WEB",
-      `Registered WebSocket for async image (attempt ${attempt + 1}, ${remaining}ms remaining)`
-    );
-    const outcome = await waitForImageViaWebSocket(wssUrl, conversationId, remaining, ctx);
-    if (outcome.pointers.length > 0) return outcome.pointers;
-    if (ctx.signal?.aborted) return [];
-    // Only retry when the connection died before producing anything useful.
-    // A clean close with no pointers (e.g., upstream cancellation) shouldn't
-    // burn a second attempt — the result would be the same.
-    if (!outcome.errored || outcome.gotAnyMessage) break;
-    ctx.log?.warn?.(
-      "CGPT-WEB",
-      `WebSocket attempt ${attempt + 1} ended in transport error before any frame; retrying`
-    );
-  }
-
-  // Fallback: the async image websocket is unreliable in some environments —
-  // register-websocket is Cloudflare-sensitive and the plain WebSocket lacks the
-  // browser TLS fingerprint the HTTP client uses, so it can error or receive no
-  // frames even though the image was generated. The image still lands in the
-  // conversation, so poll it over the same authenticated HTTP path used
-  // everywhere else and read the image_asset_pointer directly. This is the
-  // durable fallback recommended in #7357.
-  const pollDeadline = Math.max(deadline, Date.now() + 60_000);
-  while (Date.now() < pollDeadline && !ctx.signal?.aborted) {
-    const { detail } = await fetchConversationDetail(conversationId, ctx);
-    const mapping = detail?.mapping;
-    if (mapping) {
+  // Snapshot the newest image pointers from the conversation, if any.
+  async function pollConversationOnce(): Promise<ImagePointerRef[] | null> {
+    try {
+      const { detail } = await fetchConversationDetail(conversationId, ctx);
+      const mapping = detail?.mapping;
+      if (!mapping) return null;
       // Prefer the newest message carrying image pointers, so a reused
       // conversation doesn't surface a stale image from an earlier turn.
       let newest: { pointers: ImagePointerRef[]; at: number } | null = null;
@@ -2629,17 +2591,67 @@ async function pollForAsyncImage(
         const at = message?.create_time ?? 0;
         if (!newest || at >= newest.at) newest = { pointers, at };
       }
-      if (newest) {
-        ctx.log?.info?.(
-          "CGPT-WEB",
-          `Recovered ${newest.pointers.length} image pointer(s) via conversation poll (websocket yielded none)`
-        );
-        return newest.pointers;
-      }
+      return newest?.pointers ?? null;
+    } catch {
+      return null;
     }
-    await delayWithAbort(3_000, ctx.signal);
   }
-  return [];
+
+  // The async-image WebSocket is unreliable in some environments —
+  // register-websocket is Cloudflare-sensitive and the plain WebSocket lacks
+  // the browser TLS fingerprint the HTTP client uses, so it can error or
+  // receive no frames even though the image was generated. The image still
+  // lands in the conversation, so we poll the conversation over the same
+  // authenticated HTTP path CONCURRENTLY with the WS wait and return the
+  // first source that produces pointers. Previously the conversation poll
+  // only started after the WS budget expired, which made image generation
+  // take ~4-5 min end-to-end even though chatgpt.com showed the finished
+  // image in ~1 min.
+  const wssUrl = await registerWebSocket(ctx).catch(() => null);
+  if (!wssUrl) {
+    ctx.log?.warn?.("CGPT-WEB", "Could not register WebSocket — conversation poll only");
+  } else {
+    ctx.log?.debug?.("CGPT-WEB", "Registered WebSocket for async image (concurrent with poll)");
+  }
+  const wsPromise = wssUrl
+    ? waitForImageViaWebSocket(wssUrl, conversationId, totalTimeoutMs, ctx).then((o) => o.pointers)
+    : Promise.resolve([] as ImagePointerRef[]);
+
+  return new Promise<ImagePointerRef[]>((resolve) => {
+    let settled = false;
+    const settle = (pointers: ImagePointerRef[]) => {
+      if (!settled) {
+        settled = true;
+        resolve(pointers);
+      }
+    };
+
+    // WS winner.
+    wsPromise
+      .then((pointers) => {
+        if (pointers.length > 0) settle(pointers);
+      })
+      .catch(() => {});
+
+    // Conversation-poll winner (the durable path).
+    (async () => {
+      while (!settled && Date.now() < pollDeadline && !ctx.signal?.aborted) {
+        const pointers = await pollConversationOnce();
+        if (pointers && pointers.length > 0) {
+          ctx.log?.info?.(
+            "CGPT-WEB",
+            `Recovered ${pointers.length} image pointer(s) via conversation poll (concurrent with websocket)`
+          );
+          settle(pointers);
+          return;
+        }
+        await delayWithAbort(2_000, ctx.signal);
+      }
+      // Poll budget exhausted: fall back to whatever the WS produced.
+      const wsPointers = await wsPromise.catch(() => [] as ImagePointerRef[]);
+      settle(wsPointers);
+    })();
+  });
 }
 
 function makeImageResolver(ctx: ResolverContext): ImageResolver {
