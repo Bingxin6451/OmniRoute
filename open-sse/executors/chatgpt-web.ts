@@ -2543,11 +2543,15 @@ async function waitForImageViaWebSocket(
   });
 }
 
-// Default 3-minute wait for the async image_gen tool to produce an image
-// pointer over the celsius WebSocket. Tunable so deployments can stretch
-// during chatgpt.com queue-deep windows ("Lots of people are creating
-// images right now") without code changes.
-const DEFAULT_ASYNC_IMAGE_TIMEOUT_MS = 180_000;
+// Default 4-minute wait for the async image_gen tool to produce an image
+// pointer over the celsius WebSocket. Measured end-to-end on a live
+// chatgpt.com Plus session (2026-08): a single GPT-5.5 Instant image took
+// ~222s to resolve, and the previous 180s default left <60s of poll-fallback
+// margin — generations can exceed that during chatgpt.com queue-deep
+// windows ("Lots of people are creating images right now"). The poll
+// fallback extends the budget by another 60s, so 240s → ~300s total.
+// Tunable via OMNIROUTE_CGPT_WEB_IMAGE_TIMEOUT_MS.
+const DEFAULT_ASYNC_IMAGE_TIMEOUT_MS = 240_000;
 
 function configuredAsyncImageTimeoutMs(): number {
   const raw = Number(process.env.OMNIROUTE_CGPT_WEB_IMAGE_TIMEOUT_MS);
